@@ -6,7 +6,7 @@ import struct
 import time
 from collections import namedtuple
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from Crypto import Random
 from Crypto.Cipher import AES
@@ -31,7 +31,6 @@ class CloudBackup:
     ACTION_MAP = {
         'backup': 'action_backup',
         'restore': 'action_restore',
-        'list': 'action_list',
         'search': 'action_search',
     }
 
@@ -55,28 +54,43 @@ class CloudBackup:
     def action_backup(self, source: str):
         source = Path(source).absolute()
 
-        print(f"Packing file {source.name} ...")
         packed_source = self._pack_data(source)
-        print(f"Encrypting file {packed_source.name} ...")
         enc_key = self._get_enc_key(self.enc_data)
         encrypted_source = self._encrypt_data(packed_source, enc_key)
-        print(f"Connecting to {self.user}@{self.server}:{self.port} ...")
         self._ssh_connect(self.ssh_key_path)
-        print(f"Sending file {encrypted_source.name} ...")
         self._send_file(encrypted_source)
-        print(f"Cleanup ...")
         self._cleanup()
 
     def action_restore(self, source: str):
-        pass
+        self._ssh_connect(self.ssh_key_path)
+        remote_files = self._search_file(source)
+        if len(remote_files) == 0:
+            print(f"File {source} not found")
+            self._cleanup()
+            return
 
-    def action_list(self, source: str):
-        pass
+        if len(remote_files) > 1:
+            print(f"Multiple matching files found:")
+            print(', '.join(remote_files))
+            self._cleanup()
+            return
+
+        encrypted_data = self._download_file(Path(remote_files[0]))
+        enc_key = self._get_enc_key(self.enc_data)
+        packed_data = self._decrypt_data(encrypted_data, enc_key)
+        data = self._unpack_data(packed_data)
+        print(f"Unpacked data to {data.as_posix()}")
+        self._cleanup()
 
     def action_search(self, source: str):
-        pass
+        self._ssh_connect(self.ssh_key_path)
+        results = self._search_file(source)
+        self._cleanup()
+        print(f"Found {len(results)} results:")
+        print(', '.join(results))
 
     def _pack_data(self, source: Path) -> Path:
+        print(f"Packing file {source.name} ...")
         if not source.exists():
             raise FileNotFoundError(f"File/dir '{source.as_posix()}' not found")
 
@@ -103,6 +117,14 @@ class CloudBackup:
         tar_file = tar_base.with_suffix(tar_base.suffix + self.compress.ext)
         return tar_file
 
+    def _unpack_data(self, source: Path) -> Path:
+        print(f"Unpacking file {source.name} ...")
+        shutil.unpack_archive(source.as_posix())
+        unpacked_data = source.name
+        for opt in self.COMPRESS_MAP.keys():
+            unpacked_data = unpacked_data.replace(self.COMPRESS_MAP[opt].ext, '')
+        return Path(unpacked_data)
+
     def _get_enc_key(self, enc_data: Optional[str]) -> bytes:
         if enc_data is None:
             return getpass.getpass('Enter encryption key: ').encode()
@@ -115,6 +137,7 @@ class CloudBackup:
 
     def _encrypt_data(self, source: Path, key_data: bytes,
                       chunk_size_kb: int = 64) -> Path:
+        print(f"Encrypting file {source.name} ...")
         chunk_size = chunk_size_kb * 1024
         out_filename = Path(source.as_posix() + '.enc')
         key = SHA256.new(key_data).digest()
@@ -161,6 +184,7 @@ class CloudBackup:
         return out_filename
 
     def _send_file(self, source: Path):
+        print(f"Sending file {source.name} ...")
         send_start_time = None
 
         def _put_callback(sent, total):
@@ -183,8 +207,48 @@ class CloudBackup:
         send_start_time = time.time()
         self.sftp.put(source.as_posix(), remote_file.as_posix(),
                       _put_callback)
+        self.sftp.close()
+
+    def _download_file(self, source: Path) -> Path:
+        print(f"Downloading file {source.name} ...")
+        dl_start_time = None
+
+        def _get_callback(done, total):
+            nonlocal dl_start_time
+            speed = done / (time.time() - dl_start_time)
+            done_hum = naturalsize(done, binary=True)
+            total_hum = naturalsize(total, binary=True)
+            speed_hum = naturalsize(speed, binary=True)
+            print(f"\rDownloading... {done_hum} of {total_hum}, {speed_hum}/s    ",
+                  end='')
+
+        if self.ssh is None:
+            raise ConnectionError("SSH is not connected")
+
+        self.tmp_dir = Path(self.TMP_DIR)
+        os.makedirs(self.tmp_dir.absolute().as_posix(), exist_ok=True)
+        remote_file = Path(self.PREFIX) / source
+        local_file = self.tmp_dir / source
+
+        self.sftp: SFTPClient = self.ssh.open_sftp()
+        dl_start_time = time.time()
+        self.sftp.get(remote_file.as_posix(), local_file.as_posix(),
+                      _get_callback)
+        self.sftp.close()
+        return local_file
+
+    def _search_file(self, file_name: str) -> List[str]:
+        print(f"Searching for {file_name} ...")
+        self.sftp: SFTPClient = self.ssh.open_sftp()
+        if self.PREFIX not in self.sftp.listdir():
+            return []
+        files = self.sftp.listdir(self.PREFIX)
+        files_filtered = [f for f in files if file_name in f and f.endswith('.enc')]
+        self.sftp.close()
+        return files_filtered
 
     def _ssh_connect(self, key_file: Path):
+        print(f"Connecting to {self.user}@{self.server}:{self.port} ...")
         self.ssh = SSHClient()
         self.ssh.load_host_keys(os.path.expanduser(
             os.path.join('~', '.ssh', 'known_hosts')))
@@ -197,6 +261,7 @@ class CloudBackup:
         self.ssh.connect(self.server, self.port, self.user, pkey=key)
 
     def _cleanup(self):
+        print(f"Cleanup ...")
         if self.sftp is not None:
             self.sftp.close()
         if self.ssh is not None:
@@ -230,7 +295,7 @@ def main():
                    required=True,
                    help="Path to SSH private key")
     p.add_argument('-e', '--enc_key',
-                   required=True,
+                   required=False,
                    help="Encryption password or path to keyfile")
     p.add_argument('-c', '--compress',
                    default='off',
@@ -238,6 +303,9 @@ def main():
                    help="Compression algorithms")
 
     args = p.parse_args()
+
+    if args.action in ['backup', 'restore'] and not args.enc_key:
+        p.error("--enc_key is required to backup and restore file")
 
     cb = CloudBackup(
         server=args.hostname,
