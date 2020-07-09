@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# Copyright 2020 Marcin Kornat
+
 import argparse
 import getpass
 import os
@@ -98,6 +101,7 @@ class CloudBackup:
             return source
 
         self.tmp_dir = source.parent / self.TMP_DIR
+        os.makedirs(self.tmp_dir.as_posix(), exist_ok=True)
         if source.is_file():
             source_dir = self.tmp_dir / source.stem
             os.makedirs(source_dir.as_posix(), exist_ok=True)
@@ -149,16 +153,13 @@ class CloudBackup:
             with open(out_filename.as_posix(), 'wb') as outfile:
                 outfile.write(struct.pack('<Q', file_size))
                 outfile.write(iv)
-
                 while True:
                     chunk = infile.read(chunk_size)
                     if len(chunk) == 0:
                         break
                     elif len(chunk) % 16 != 0:
                         chunk += b' ' * (16 - len(chunk) % 16)
-
                     outfile.write(encryptor.encrypt(chunk))
-
         return out_filename
 
     def _decrypt_data(self, source: Path, key_data: bytes,
@@ -178,14 +179,12 @@ class CloudBackup:
                     if len(chunk) == 0:
                         break
                     outfile.write(decryptor.decrypt(chunk))
-
                 outfile.truncate(orig_size)
-
         return out_filename
 
     def _send_file(self, source: Path):
         print(f"Sending file {source.name} ...")
-        send_start_time = None
+        send_start_time: float = 0.0
 
         def _put_callback(sent, total):
             nonlocal send_start_time
@@ -211,7 +210,7 @@ class CloudBackup:
 
     def _download_file(self, source: Path) -> Path:
         print(f"Downloading file {source.name} ...")
-        dl_start_time = None
+        dl_start_time: float = 0.0
 
         def _get_callback(done, total):
             nonlocal dl_start_time
@@ -290,6 +289,7 @@ def main():
     p.add_argument('-p', '--port',
                    required=False,
                    type=int,
+                   default=22,
                    help="Remote server SSH port")
     p.add_argument('-k', '--privkey',
                    required=True,
